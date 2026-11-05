@@ -28,6 +28,8 @@ class vmmLibvirtObject(vmmGObject):
 
         self.__initialized = False
         self.__status = None
+        self.__recache_in_progress = False
+        self.__recache_dirty = False
 
         self._xmlobj = None
         self._xmlobj_to_define = None
@@ -252,12 +254,47 @@ class vmmLibvirtObject(vmmGObject):
 
         We refresh status and XML because they are tied together in subtle
         ways, like runtime XML changing when a VM is started.
+
+        Fetching the XML and status are synchronous libvirt RPCs, which can
+        block the main thread for a noticeable time on remote connections.
+        So the fetches are done in a worker thread, and the results are
+        applied from an idle callback on the main thread. If more events
+        trigger a recache while one is already in flight, we only rerun
+        it once after it completes.
         """
+        if self.__recache_in_progress:
+            self.__recache_dirty = True
+            return
+        self.__recache_in_progress = True
+        self.__recache_dirty = False
+
+        def _fetch_thread():
+            xml = None
+            status = None
+            error = None
+            try:
+                xml = self._XMLDesc(self._active_xml_flags)
+                status = self._get_backend_status()
+            except Exception as e:
+                error = e
+            self.idle_add(self._recache_from_event_loop_done, xml, status, error)
+
+        self._start_thread(_fetch_thread, "event refresh for %s" % self)
+
+    def _recache_from_event_loop_done(self, xml, status, error):
+        self.__recache_in_progress = False
+        dirty = self.__recache_dirty
+        self.__recache_dirty = False
+
         try:
-            self.__force_refresh_xml(nosignal=True)
+            if error is not None:
+                raise error
+            self._invalidate_xml()
+            self._xmlobj = self._parseclass(self.conn.get_backend(), parsexml=xml)
+            self._is_xml_valid = True
             # status = None forces a signal to be emitted
             self.__status = None
-            self._refresh_status()
+            self._refresh_status(newstatus=status)
         except Exception as e:
             # If we hit an exception here, it's often that the object
             # disappeared, so request the poll loop to be updated
@@ -267,6 +304,9 @@ class vmmLibvirtObject(vmmGObject):
                 kwargs = {"force": True, poll_param: True}
                 log.debug("Scheduling priority tick with: %s", kwargs)
                 self.conn.schedule_priority_tick(**kwargs)
+
+        if dirty:
+            self.recache_from_event_loop()
 
     def ensure_latest_xml(self, nosignal=False):
         """
